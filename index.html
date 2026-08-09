@@ -109,7 +109,7 @@ const SESSIONS = [
 ];
 const HEIGHT_M = 1.87;
 const KEY = "recomp-data";
-const EMPTY = { v:2, nextIdx:0, workouts:[], metrics:[{date:"2026-08-08", weight:90, bf:22, waist:null}], last:{} };
+const EMPTY = { v:3, nextIdx:0, workouts:[], metrics:[{date:"2026-08-08", weight:90, bf:22, waist:null}], last:{}, skipLog:[] };
 
 // ================= State & storage (IndexedDB) =================
 let data = structuredClone(EMPTY);
@@ -210,7 +210,21 @@ function homeHTML(){
 // ---------- Workout ----------
 function startWorkout(){
   const session = SESSIONS[data.nextIdx];
-  W = { session, i:0, log:{}, sets: initSets(session.exercises[0]) };
+  const inSession = new Set(session.exercises.map(e=>e.n));
+  const now = today();
+  const reminders = (data.skipLog||[]).filter(e =>
+    e.status==="open" && !inSession.has(e.n) && (!e.ignoreUntil || e.ignoreUntil <= now)
+  );
+  // de-dup by exercise name
+  const seen=new Set();
+  const rem = reminders.filter(e=>{ if(seen.has(e.n)) return false; seen.add(e.n); return true; });
+  W = { session, list: session.exercises.slice(), i:0, log:{}, sets:null,
+        phase: rem.length? "remind":"lift", rem, startCount: data.workouts.length };
+  if(W.phase==="lift") W.sets = initSets(W.list[0]);
+}
+function findExDef(name){
+  for(const s of SESSIONS){ const e=s.exercises.find(x=>x.n===name); if(e) return e; }
+  return null;
 }
 function initSets(ex){
   const prev = data.last[ex.n];
@@ -219,13 +233,34 @@ function initSets(ex){
   return Array.from({length:ex.sets},()=>({w,r,done:false}));
 }
 function workoutHTML(){
-  const ex = W.session.exercises[W.i];
+  if(W.phase==="remind"){
+    return `
+    <header class="headrow"><button class="ghost" data-act="cancelW">✕</button>
+      <div><div class="eyebrow">${W.session.id} · ${W.session.name}</div>
+      <div class="h2">Skipped last time</div></div></header>
+    <div class="foot">You skipped these exercises. Add them to today's session?</div>
+    <div class="stack">
+      ${W.rem.map((e,ri)=>`
+        <div class="card">
+          <div class="cardTitle">${esc(e.n)}</div>
+          <div class="cardSub">Skipped on ${e.date} (${e.sessionId} · ${esc(SESSIONS.find(s=>s.id===e.sessionId).name)})</div>
+          <div class="row2" style="margin-top:10px; grid-template-columns:1fr 1fr 1fr">
+            <button class="big" style="margin:0; padding:10px; font-size:14px" data-rem="add|${ri}">Add today</button>
+            <button class="ghost" style="width:100%; height:auto; padding:10px; font-size:13px" data-rem="later|${ri}">Not today</button>
+            <button class="ghost" style="width:100%; height:auto; padding:10px; font-size:13px" data-rem="week|${ri}">Ignore 7d</button>
+          </div>
+        </div>`).join("")}
+    </div>
+    <button class="big" data-act="startLift">Start session →</button>
+    <div class="foot">Untouched items will remind you again next session. "Ignore 7d" silences the reminder but it still counts in your report until made up.</div>`;
+  }
+  const ex = W.list[W.i];
   const prev = data.last[ex.n];
   const prevTxt = prev? ` · last time ${prev.w>0?prev.w+" kg × ":""}${prev.r} — beat it` : ex.bw? " · bodyweight" : ` · suggested start ${ex.start} kg`;
   const anyDone = W.sets.some(s=>s.done);
   return `
   <header class="headrow"><button class="ghost" data-act="cancelW">✕</button>
-    <div><div class="eyebrow">${W.session.id} · ${W.session.name} — ${W.i+1}/${W.session.exercises.length}</div>
+    <div><div class="eyebrow">${W.session.id} · ${W.session.name} — ${W.i+1}/${W.list.length}</div>
     <div class="h2">${esc(ex.n)}</div></div></header>
   <div class="target">Target: ${ex.sets} × ${ex.reps}${prevTxt}</div>
   <div id="timerSlot">${restT?timerHTML():""}</div>
@@ -238,7 +273,8 @@ function workoutHTML(){
         <button class="tick ${st.done?"on":""}" data-tick="${idx}">✓</button>
       </div>`).join("")}
   </div>
-  <button class="big" data-act="nextEx" ${anyDone?"":"disabled"}>${W.i+1<W.session.exercises.length?"Next exercise →":"Finish workout ✓"}</button>
+  <button class="big" data-act="nextEx" ${anyDone?"":"disabled"}>${W.i+1<W.list.length?"Next exercise →":"Finish workout ✓"}</button>
+  ${anyDone?"":`<button class="ghost" style="width:100%; height:auto; padding:12px; font-size:14px" data-act="skipEx">Skip this exercise</button>`}
   <div class="foot">Tick each set when done — the rest timer starts itself. Tap +/− for 1 kg, hold for 5 kg jumps.</div>`;
 }
 function stepperHTML(idx, field, label, val){
@@ -271,43 +307,63 @@ function tickSet(idx){
   const st = W.sets[idx];
   st.done = !st.done;
   if(st.done){
-    const ex = W.session.exercises[W.i];
-    const more = W.sets.some(s=>!s.done) || W.i+1 < W.session.exercises.length;
+    const ex = W.list[W.i];
+    const more = W.sets.some(s=>!s.done) || W.i+1 < W.list.length;
     if(more) startRest(ex.rest);
   }
   render();
 }
 function stepVal(idx, field, dir, amount){
-  const ex = W.session.exercises[W.i];
+  const ex = W.list[W.i];
   const st = W.sets[idx];
   if(field==="w"){ st.w = Math.max(0, +(st.w + dir*amount).toFixed(1)); }
   else {
     const base = ex.n==="Plank"?5:1;
     st.r = Math.max(1, st.r + dir*(amount===5? (ex.n==="Plank"?15:5) : base));
   }
-  // update just the value display
   render();
 }
-function nextExercise(){
-  const ex = W.session.exercises[W.i];
-  W.log[ex.n] = W.sets.filter(s=>s.done);
+function skipExercise(){
+  const ex = W.list[W.i];
+  data.skipLog.push({ n:ex.n, sessionId:W.session.id, date:today(), status:"open", ignoreUntil:null, atWorkout:W.startCount });
+  save();
+  advance();
+}
+function advance(){
   stopTimerTick(true);
-  if(W.i+1 < W.session.exercises.length){
+  if(W.i+1 < W.list.length){
     W.i++;
-    W.sets = initSets(W.session.exercises[W.i]);
+    W.sets = initSets(W.list[W.i]);
     render();
   } else {
-    const best = {};
-    for(const [name,arr] of Object.entries(W.log)){
-      if(!arr.length) continue;
-      best[name] = arr.reduce((a,b)=> (b.w>a.w||(b.w===a.w&&b.r>a.r))?b:a );
-    }
-    data.workouts.push({ date:today(), sessionId:W.session.id, name:W.session.name, sets:W.log, best });
-    data.nextIdx = (data.nextIdx+1)%4;
-    Object.assign(data.last, best);
-    save();
-    W=null; go("home");
+    finishWorkout();
   }
+}
+function nextExercise(){
+  const ex = W.list[W.i];
+  W.log[ex.n] = W.sets.filter(s=>s.done);
+  advance();
+}
+function finishWorkout(){
+  const best = {};
+  const doneNames = new Set();
+  for(const [name,arr] of Object.entries(W.log)){
+    if(!arr.length) continue;
+    doneNames.add(name);
+    best[name] = arr.reduce((a,b)=> (b.w>a.w||(b.w===a.w&&b.r>a.r))?b:a );
+  }
+  // resolve skip log: only entries created BEFORE this workout
+  for(const e of data.skipLog){
+    if(e.status!=="open") continue;
+    if(e.atWorkout !== undefined && e.atWorkout >= W.startCount) continue; // skipped this very workout
+    if(doneNames.has(e.n)) e.status="made-up";
+    else if(W.session.id === e.sessionId) e.status="missed"; // rotation returned, still not done
+  }
+  data.workouts.push({ date:today(), sessionId:W.session.id, name:W.session.name, sets:W.log, best });
+  data.nextIdx = (data.nextIdx+1)%4;
+  Object.assign(data.last, best);
+  save();
+  W=null; go("home");
 }
 
 // ---------- Check-in ----------
@@ -367,6 +423,25 @@ function progressHTML(){
     const a=hist[0], b=hist[hist.length-1];
     return {n, a, b, rm:est1RM(b.w,b.r), up: b.w>a.w||(b.w===a.w&&b.r>a.r)};
   }).filter(Boolean);
+  // all-exercise progress
+  const allNames=[...new Set(data.workouts.flatMap(wk=>Object.keys(wk.best||{})))];
+  const allProg=allNames.map(n=>{
+    const hist=data.workouts.map(wk=>wk.best&&wk.best[n]).filter(Boolean);
+    const a=hist[0], b=hist[hist.length-1];
+    return {n,a,b,up: b.w>a.w||(b.w===a.w&&b.r>a.r)};
+  });
+  // skip report
+  const sk=data.skipLog||[];
+  const skOpen=sk.filter(e=>e.status==="open"), skMade=sk.filter(e=>e.status==="made-up"), skMiss=sk.filter(e=>e.status==="missed");
+  const skHTML = sk.length? `
+  <div class="eyebrow" style="margin-top:6px">SKIPPED EXERCISES</div>
+  <div class="table">
+    <div class="tr trhead"><span>Exercise</span><span>Date</span><span>Session</span><span>Status</span></div>
+    ${[...sk].reverse().slice(0,12).map(e=>`
+      <div class="tr"><span style="font-weight:600">${esc(e.n)}</span><span>${e.date}</span><span>${e.sessionId}</span>
+      <span class="${e.status==="made-up"?"good":e.status==="missed"?"badd":"flat"}">${e.status==="made-up"?"made up":e.status}</span></div>`).join("")}
+  </div>
+  <div class="foot">${skOpen.length} pending · ${skMade.length} made up · ${skMiss.length} missed. Pending skips remind you at your next session.</div>`:"";
   return `
   <header class="headrow"><button class="ghost" data-go="home">←</button>
     <div><div class="eyebrow">PROGRESS</div><div class="h2">${data.workouts.length} workouts · ${m.length-1} check-ins</div></div></header>
@@ -385,6 +460,12 @@ function progressHTML(){
   <div class="table">${lifts.map(h=>`
     <div class="tr"><span style="font-weight:600">${esc(h.n)}</span>
     <span>${h.a.w}×${h.a.r} → ${h.b.w}×${h.b.r}</span><span>1RM ≈ ${fmt1(h.rm)} kg</span>
+    <span class="${h.up?"good":"flat"}">${h.up?"▲":"="}</span></div>`).join("")}</div>`:""}
+  ${skHTML}
+  ${allProg.length?`<div class="eyebrow" style="margin-top:6px">ALL EXERCISES — first → latest top set</div>
+  <div class="table">${allProg.map(h=>`
+    <div class="tr" style="grid-template-columns:1.6fr 1fr 1fr .5fr"><span style="font-weight:600">${esc(h.n)}</span>
+    <span>${h.a.w>0?h.a.w+"×"+h.a.r:h.a.r}</span><span>${h.b.w>0?h.b.w+"×"+h.b.r:h.b.r}</span>
     <span class="${h.up?"good":"flat"}">${h.up?"▲":"="}</span></div>`).join("")}</div>`:""}
   <button class="card" data-go="history"><div class="cardTitle">Workout history →</div><div class="cardSub">Every session, every set</div></button>
   <div class="foot">Scale flat is fine. Fat mass ↓ + waist ↓ + lifts ↑ = the plan is working.</div>`;
@@ -469,6 +550,8 @@ function bind(){
     el.addEventListener("click",()=>{
       if(a==="cancelW"){ stopTimerTick(true); W=null; go("home"); }
       else if(a==="nextEx"){ if(!el.disabled) nextExercise(); }
+      else if(a==="skipEx"){ skipExercise(); }
+      else if(a==="startLift"){ W.phase="lift"; W.sets=initSets(W.list[W.i]); render(); }
       else if(a==="skipRest"){ stopTimerTick(true); const s=document.getElementById("timerSlot"); if(s) s.innerHTML=""; }
       else if(a==="saveCk"){ if(!el.disabled) saveCheckin(); }
       else if(a==="modeExport"){ DP.mode="export"; DP.msg=null; render(); }
@@ -503,6 +586,21 @@ function bind(){
     });
     el.addEventListener("change",()=>render());
   });
+  app.querySelectorAll("[data-rem]").forEach(el=>el.addEventListener("click",()=>{
+    const [what,ri]=el.dataset.rem.split("|"); const e=W.rem[+ri];
+    if(!e) return;
+    if(what==="add"){
+      const def=findExDef(e.n);
+      if(def && !W.list.some(x=>x.n===e.n)) W.list.push(def);
+    } else if(what==="week"){
+      const d=new Date(); d.setDate(d.getDate()+7);
+      e.ignoreUntil=d.toISOString().slice(0,10);
+      save();
+    } // "later": no change
+    W.rem = W.rem.filter((_,j)=>j!==+ri);
+    if(!W.rem.length){ W.phase="lift"; W.sets=initSets(W.list[W.i]); }
+    render();
+  }));
   app.querySelectorAll("[data-hist]").forEach(el=>el.addEventListener("click",()=>{
     const i=+el.dataset.hist; histOpen = histOpen===i? null : i; render();
   }));
@@ -529,3 +627,4 @@ function bind(){
 </script>
 </body>
 </html>
+
